@@ -1,9 +1,7 @@
 use std::net::SocketAddrV4;
 
 use actix_web::{
-    App, HttpResponse, HttpServer, Responder, get,
-    http::header::ContentType,
-    web::{self, Data},
+    get, http::header::ContentType, web::{self, Data}, App, HttpResponse, HttpServer, Responder
 };
 use biomemap::{CachePool, ContourLines};
 use cubiomes::{
@@ -15,7 +13,7 @@ use tileprovider::TileProvider;
 
 mod biomemap;
 mod tileprovider;
-
+mod structuregen;
 const SEED: i64 = 3846517875239123423;
 
 #[actix_web::main]
@@ -36,6 +34,7 @@ async fn main() -> std::io::Result<()> {
             get_biome_tile,
             get_biome_tile_shaded,
             get_contour_tile,
+            get_structure,
             actix_files::Files::new("/", concat!(env!("OUT_DIR"), "/pages"))
                 .index_file("index.html"),
         ))
@@ -115,4 +114,25 @@ async fn get_contour_tile(
     HttpResponse::Ok()
         .content_type(ContentType::png())
         .body(buf)
+}
+
+#[get("/structure_gen/{structure}/{x}/{y}")]
+async fn get_structure(
+    path: web::Path<(String,i32, i32)>,
+) -> impl Responder {
+    let (structure, x, y) = path.into_inner();
+    let pos=structuregen::structure(x, y, SEED);
+    match pos{
+        None=>{
+            HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body("{}")
+        }
+        Some(pos)=>{
+            let body =serde_json::to_string(&pos).unwrap();
+            HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body(body)
+        }
+    }
 }

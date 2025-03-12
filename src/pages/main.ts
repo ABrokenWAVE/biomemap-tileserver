@@ -95,8 +95,10 @@ export class StructureGrid extends leaflet.GridLayer {
             fetch(url).then(x => x.json())
             .then(structure=>{
                 if('exists' in structure){
-                let marker = new StructureMarker(structure.x,structure.z,this.structurename);
-                tile.linkedMarker = marker
+                    if(structure.exists==true){
+                        let marker = new StructureMarker(structure.x,structure.z,this.structurename);
+                        tile.linkedMarker = marker
+                    }
                 }
                 done(error, tile);
             })

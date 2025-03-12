@@ -14,8 +14,6 @@ use cubiomes::{
     enums::MCVersion,
     generator::{Generator, GeneratorFlags},
 };
-use image::codecs::png::PngEncoder;
-use tileprovider::TileProvider;
 
 mod biomemap;
 mod tileprovider;
@@ -23,6 +21,7 @@ mod structuregen;
 use image::ImageFormat;
 
 const SEED: i64 = 3846517875239123423;
+const VERSION: MCVersion = MCVersion::MC_1_21_WD;
 //const NOTILEPNG: &[u8] = include_bytes!("notile.png").as_slice();
 
 // Note change urls if you change this
@@ -70,11 +69,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "./tiles/contour/",
     )?);
 
+    let structure_data = web::Data::new(structuregen::StructureData::new(SEED,VERSION));
+
+
     HttpServer::new(move || {
         App::new()
             .app_data(shade_tile_cache.clone())
             .app_data(unsahded_tile_cahce.clone())
             .app_data(contour_line_cache.clone())
+            .app_data(structure_data.clone())
             .service((
                 get_biome_tile,
                 get_biome_tile_shaded,
@@ -142,9 +145,11 @@ async fn get_contour_tile(
 #[get("/structure_gen/{structure}/{x}/{y}")]
 async fn get_structure(
     path: web::Path<(String,i32, i32)>,
+    structure_data: Data<structuregen::StructureData>,
 ) -> impl Responder {
-    let (structure, x, y) = path.into_inner();
-    let pos=structuregen::structure(x, y, SEED);
+    let (structure_name, x, y) = path.into_inner();
+    let structre = structuregen::structure_from_string(&structure_name);
+    let pos=structuregen::structure(x, y, structre, &structure_data);
     match pos{
         None=>{
             HttpResponse::Ok()

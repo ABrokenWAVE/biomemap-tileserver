@@ -4,28 +4,39 @@ use std::{
     collections::BTreeMap,
     error::Error,
     ops::{Deref, DerefMut},
-    sync::Mutex,
+    sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use cubiomes::generator::{Cache, Generator, Range, Scale};
 use image::GrayAlphaImage;
+use log::debug;
 use postprocess::{
     concat_lower_zoom, draw_contours, draw_shading, generate_heightmap, get_image,
     upsacale_blockscale,
 };
 
-use crate::tileprovider::TileProvider;
+use crate::tileprovider::{TilePos, TileProvider};
 
 pub struct CachePool<'pool> {
     generator: &'pool Generator,
-    caches: Mutex<BTreeMap<Scale, Vec<Cache<'pool>>>>,
+    caches: Arc<Mutex<BTreeMap<Scale, Vec<Cache<'pool>>>>>,
+}
+
+impl Clone for CachePool<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            generator: self.generator,
+            caches: self.caches.clone(),
+        }
+    }
 }
 
 impl<'pool> CachePool<'pool> {
     pub fn new(generator: &'pool Generator) -> Self {
         Self {
             generator,
-            caches: Mutex::new(BTreeMap::new()),
+            caches: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -43,11 +54,15 @@ impl<'pool> CachePool<'pool> {
     where
         'pool: 'lock,
     {
-        let mut caches = self.caches.lock().unwrap();
+        let cache: Option<Cache<'pool>> = {
+            let pre_lock = Instant::now();
+            let mut caches = self.caches.lock().unwrap();
 
-        caches.entry(scale).or_default();
+            caches.entry(scale).or_default();
+            debug!("{:?}", pre_lock.elapsed());
 
-        let cache: Option<Cache<'pool>> = caches.get_mut(&scale).unwrap().pop();
+            caches.get_mut(&scale).unwrap().pop()
+        };
 
         if let Some(mut cache) = cache {
             cache.move_cache(x, y, z)?;
@@ -158,24 +173,97 @@ impl CachePool<'_> {
     }
 }
 
-pub struct ContourLines<'a, 'b>(pub &'a CachePool<'b>)
-where
-    'b: 'a;
+pub struct ShadedBiomeTile<'a>(CachePool<'a>);
 
-impl TileProvider for ContourLines<'_, '_> {
-    fn get_tile(&self, zoom: i32, x: i32, y: i32) -> Option<image::DynamicImage> {
-        let heightmap = generate_heightmap(x * 256, y * 256, zoom, self.0);
+impl<'a> ShadedBiomeTile<'a> {
+    pub fn new(inner: CachePool<'a>) -> ShadedBiomeTile<'a> {
+        Self(inner)
+    }
+}
 
-        let frequency = 15;
+impl TileProvider for ShadedBiomeTile<'_> {
+    fn get_tile(&self, pos: TilePos) -> Option<image::DynamicImage> {
+        self.0.get_tile(pos.zoom, pos.x, pos.y, true)
+    }
+}
+
+impl<'a> From<CachePool<'a>> for ShadedBiomeTile<'a> {
+    fn from(value: CachePool<'a>) -> Self {
+        Self(value)
+    }
+}
+
+pub struct UnshadedBiomeTile<'a>(CachePool<'a>);
+
+impl TileProvider for UnshadedBiomeTile<'_> {
+    fn get_tile(&self, pos: TilePos) -> Option<image::DynamicImage> {
+        self.0.get_tile(pos.zoom, pos.x, pos.y, false)
+    }
+}
+
+impl<'a> From<CachePool<'a>> for UnshadedBiomeTile<'a> {
+    fn from(value: CachePool<'a>) -> Self {
+        Self(value)
+    }
+}
+pub struct ContourLines<'a>(pub CachePool<'a>);
+
+impl TileProvider for ContourLines<'_> {
+    fn get_tile(&self, pos: TilePos) -> Option<image::DynamicImage> {
+        let TilePos { x, y, zoom } = pos;
+
+        let heightmap = generate_heightmap(x * 256, y * 256, zoom, &self.0);
+
+        let start_level: u8 = 62;
+        let frequency = zoom_calc(zoom, |_| 30, |scale| ((15 * (scale)) as u8));
 
         let mut tile = GrayAlphaImage::from_pixel(256, 256, [0, 0].into());
 
         draw_contours(
             &heightmap,
-            (0..=(u8::MAX)).step_by(15).map(|x| x + (frequency % 15)),
+            contour_levels(start_level, frequency / 3),
             &mut tile,
+            30,
+            255,
+        );
+
+        draw_contours(
+            &heightmap,
+            contour_levels(start_level, frequency),
+            &mut tile,
+            80,
+            255,
         );
 
         Some(tile.into())
+    }
+}
+
+impl<'a> From<CachePool<'a>> for ContourLines<'a> {
+    fn from(value: CachePool<'a>) -> Self {
+        Self(value)
+    }
+}
+
+/// Generates heights every frequency levels.
+///
+/// Starts from start level and goes both ways until [u8::min] and [u8::max]
+pub fn contour_levels(start_levels: u8, frequency: u8) -> impl Iterator<Item = u8> {
+    (u8::MIN..u8::MAX)
+        .step_by(frequency as usize)
+        .map(move |x| x + (start_levels % frequency))
+}
+
+pub fn zoom_calc<F1, F2, T>(zoom: i32, zoomed_in: F1, zoomed_out: F2) -> T
+where
+    F1: Fn(u32) -> T,
+    F2: Fn(u32) -> T,
+{
+    let scale = 2_u32.pow(zoom.unsigned_abs());
+
+    if zoom.is_negative() {
+        zoomed_out(scale)
+    } else {
+        zoomed_in(scale)
     }
 }

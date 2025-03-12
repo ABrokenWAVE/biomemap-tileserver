@@ -1,9 +1,15 @@
-use std::net::SocketAddrV4;
+use std::{error::Error, net::SocketAddrV4};
 
 use actix_web::{
     get, http::header::ContentType, web::{self, Data}, App, HttpResponse, HttpServer, Responder
 };
-use biomemap::{CachePool, ContourLines};
+use biomemap_tileserver::{
+    biomemap::{CachePool, ContourLines, ShadedBiomeTile, UnshadedBiomeTile},
+    tileprovider::{
+        TilePos,
+        tilecache::{self, TileCache},
+    },
+};
 use cubiomes::{
     enums::MCVersion,
     generator::{Generator, GeneratorFlags},
@@ -14,37 +20,75 @@ use tileprovider::TileProvider;
 mod biomemap;
 mod tileprovider;
 mod structuregen;
+use image::ImageFormat;
+
 const SEED: i64 = 3846517875239123423;
+//const NOTILEPNG: &[u8] = include_bytes!("notile.png").as_slice();
+
+// Note change urls if you change this
+const TILE_IMAGE_FORMAT: ImageFormat = image::ImageFormat::Png;
+
+const CACHED_TILE_AMOUNT: usize = 50000;
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    let address = SocketAddrV4::new("0.0.0.0".parse().unwrap(), 3000);
+async fn main() -> Result<(), Box<dyn Error>> {
+    // SAFETY: probs??? i dont think anything elsee is touching the env vars yet ...
+    // lol
+    unsafe {
+        std::env::set_var("RUST_LOG", "debug");
+    }
+    env_logger::init();
 
-    let server = HttpServer::new(|| {
-        let g = Box::leak(Box::new(Generator::new(
-            MCVersion::MC_1_21_WD,
-            SEED,
-            cubiomes::enums::Dimension::DIM_OVERWORLD,
-            GeneratorFlags::empty(),
-        )));
+    let address = SocketAddrV4::new("0.0.0.0".parse()?, 3000);
+    let g = Box::leak(Box::new(Generator::new(
+        MCVersion::MC_1_21_WD,
+        SEED,
+        cubiomes::enums::Dimension::DIM_OVERWORLD,
+        GeneratorFlags::empty(),
+    )));
 
-        let cache_pool = web::Data::new(CachePool::new(g));
+    let cache_pool = CachePool::new(g);
 
-        App::new().app_data(cache_pool).service((
-            get_biome_tile,
-            get_biome_tile_shaded,
-            get_contour_tile,
-            get_structure,
-            actix_files::Files::new("/", concat!(env!("OUT_DIR"), "/pages"))
-                .index_file("index.html"),
-        ))
+    let shade_tile_cache = web::Data::new(TileCache::new(
+        ShadedBiomeTile::from(cache_pool.clone()),
+        CACHED_TILE_AMOUNT,
+        TILE_IMAGE_FORMAT,
+        "./tiles/shaded/",
+    )?);
+
+    let unsahded_tile_cahce = web::Data::new(TileCache::new(
+        UnshadedBiomeTile::from(cache_pool.clone()),
+        CACHED_TILE_AMOUNT,
+        TILE_IMAGE_FORMAT,
+        "./tiles/unshaded/",
+    )?);
+
+    let contour_line_cache = web::Data::new(TileCache::new(
+        ContourLines::from(cache_pool),
+        CACHED_TILE_AMOUNT,
+        TILE_IMAGE_FORMAT,
+        "./tiles/contour/",
+    )?);
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(shade_tile_cache.clone())
+            .app_data(unsahded_tile_cahce.clone())
+            .app_data(contour_line_cache.clone())
+            .service((
+                get_biome_tile,
+                get_biome_tile_shaded,
+                get_contour_tile,
+                get_structure,
+                actix_files::Files::new("/", concat!(env!("OUT_DIR"), "/pages"))
+                    .index_file("index.html"),
+            ))
     })
     .bind(address)?
-    .run();
+    .run()
+    .await?;
 
-    println!("server running at http://{}", address);
-
-    server.await
+    Ok(())
 }
 
 #[get("/")]
@@ -54,66 +98,45 @@ async fn index() -> impl Responder {
         .body(include_str!("pages/index.html"))
 }
 
-#[get("/biomemap/{zoom}/{x}/{y}.png")]
+#[get("/biomemap_shaded/{zoom}/{x}/{y}.png")]
 async fn get_biome_tile(
     path: web::Path<(i32, i32, i32)>,
-    cache_pool: Data<CachePool<'_>>,
-) -> impl Responder {
+    cache_pool: Data<TileCache<ShadedBiomeTile<'_>>>,
+) -> Result<impl Responder, tilecache::Error> {
     let (zoom, x, y) = path.into_inner();
-    let Some(tile) = cache_pool.get_tile(zoom, x, y, false) else {
-        return HttpResponse::NotFound()
-            .content_type(ContentType::png())
-            .body(include_bytes!("notile.png").as_slice());
-    };
 
-    let mut buf = Vec::new();
+    let tile = cache_pool.get_cached_tile(TilePos { zoom, x, y }).await?;
 
-    tile.write_with_encoder(PngEncoder::new(&mut buf)).unwrap();
-
-    HttpResponse::Ok()
-        .content_type(ContentType::png())
-        .body(buf)
+    Ok(HttpResponse::Ok()
+        .content_type(cache_pool.format().to_mime_type())
+        .body(tile))
 }
 
-#[get("/biomemap_shaded/{zoom}/{x}/{y}.png")]
+#[get("/biomemap/{zoom}/{x}/{y}.png")]
 async fn get_biome_tile_shaded(
     path: web::Path<(i32, i32, i32)>,
-    cache_pool: Data<CachePool<'_>>,
-) -> impl Responder {
+    cache_pool: Data<TileCache<UnshadedBiomeTile<'_>>>,
+) -> Result<impl Responder, tilecache::Error> {
     let (zoom, x, y) = path.into_inner();
-    let Some(tile) = cache_pool.get_tile(zoom, x, y, true) else {
-        return HttpResponse::NotFound()
-            .content_type(ContentType::png())
-            .body(include_bytes!("notile.png").as_slice());
-    };
+    let tile = cache_pool.get_cached_tile(TilePos::new(zoom, x, y)).await?;
 
-    let mut buf = Vec::new();
-
-    tile.write_with_encoder(PngEncoder::new(&mut buf)).unwrap();
-
-    HttpResponse::Ok()
-        .content_type(ContentType::png())
-        .body(buf)
+    Ok(HttpResponse::Ok()
+        .content_type(cache_pool.format().to_mime_type())
+        .body(tile))
 }
 
 #[get("/contours/{zoom}/{x}/{y}.png")]
 async fn get_contour_tile(
     path: web::Path<(i32, i32, i32)>,
-    cache_pool: Data<CachePool<'_>>,
-) -> impl Responder {
+    cache_pool: Data<TileCache<ContourLines<'_>>>,
+) -> Result<impl Responder, tilecache::Error> {
     let (zoom, x, y) = path.into_inner();
 
-    let Some(tile) = ContourLines(&cache_pool).get_tile(zoom, x, y) else {
-        return HttpResponse::NotFound().finish();
-    };
+    let tile = cache_pool.get_cached_tile(TilePos::new(zoom, x, y)).await?;
 
-    let mut buf = Vec::new();
-
-    tile.write_with_encoder(PngEncoder::new(&mut buf)).unwrap();
-
-    HttpResponse::Ok()
-        .content_type(ContentType::png())
-        .body(buf)
+    Ok(HttpResponse::Ok()
+        .content_type(cache_pool.format().to_mime_type())
+        .body(tile))
 }
 
 #[get("/structure_gen/{structure}/{x}/{y}")]
